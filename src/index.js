@@ -77,7 +77,7 @@ export default {
           model: selectedModel,
           messages,
           temperature: body.temperature ?? 0.9,
-          max_tokens: Math.min(body.max_tokens || 9024, 9024),
+          max_tokens: Math.min(body.max_tokens || 8024, 8024),
           ...(needsThinking && {
             chat_template_kwargs: {
               enable_thinking: true,
