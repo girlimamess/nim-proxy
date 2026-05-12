@@ -38,7 +38,7 @@ async function callNVIDIA(model, messages, body, env, signal) {
       model,
       messages,
       temperature: body.temperature ?? 0.9,
-      max_tokens: Math.min(body.max_tokens || 8024, 8024),
+      max_tokens: Math.min(body.max_tokens || 9024, 9024),
       stream: true
     })
   });
