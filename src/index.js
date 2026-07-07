@@ -5,27 +5,7 @@ const MODEL_MAP = {
   "mistral": "mistralai/mistral-large-3-675b-instruct-2512"
 };
 
-// 🔁 fallback chain (MATCHES REAL MODEL IDS)
-const FALLBACKS = {
-  "meta/llama-3.1-70b-instruct": [
-    "meta/llama-3.1-8b-instruct"
-  ],
-
-  "deepseek-ai/deepseek-v4-pro": [
-    "deepseek-ai/deepseek-v4-flash",
-    "meta/llama-3.1-70b-instruct"
-  ],
-
-  "deepseek-ai/deepseek-v4-flash": [
-    "meta/llama-3.1-70b-instruct"
-  ],
-
-  "mistralai/mistral-large-3-675b-instruct-2512": [
-    "meta/llama-3.1-70b-instruct"
-  ]
-};
-
-// 🔥 safe call
+// NVIDIA call
 async function callNVIDIA(model, messages, body, env, signal) {
   return fetch("https://integrate.api.nvidia.com/v1/chat/completions", {
     method: "POST",
@@ -48,6 +28,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
+    // CORS
     if (request.method === "OPTIONS") {
       return new Response(null, {
         headers: {
@@ -58,74 +39,85 @@ export default {
       });
     }
 
+    // Health check
     if (url.pathname === "/health") {
       return new Response("OK", {
-        headers: { "Access-Control-Allow-Origin": "*" }
+        headers: {
+          "Access-Control-Allow-Origin": "*"
+        }
       });
     }
 
+    // Route guard
     if (url.pathname !== "/v1/chat/completions") {
-      return new Response("Not Found", { status: 404 });
+      return new Response("Not Found", {
+        status: 404,
+        headers: {
+          "Access-Control-Allow-Origin": "*"
+        }
+      });
     }
 
+    // Parse request
     let body;
     try {
       body = await request.json();
     } catch {
-      return new Response("Invalid JSON", { status: 400 });
+      return new Response("Invalid JSON", {
+        status: 400,
+        headers: {
+          "Access-Control-Allow-Origin": "*"
+        }
+      });
     }
 
-    const inputModel = body.model || "llama-70b";
+    // Default model: DeepSeek Flash
+    const inputModel = body.model || "deepseek-flash";
 
-    const primaryModel =
-      MODEL_MAP[inputModel] || "meta/llama-3.1-70b-instruct";
+    const model =
+      MODEL_MAP[inputModel] ||
+      "deepseek-ai/deepseek-v4-flash";
 
     const messages =
       Array.isArray(body.messages) && body.messages.length > 0
         ? body.messages
         : [{ role: "user", content: "Hello" }];
 
-    // 🔁 FIXED CHAIN (always safe)
-    const chain = [
-      primaryModel,
-      ...(FALLBACKS[primaryModel] || [
-        "meta/llama-3.1-70b-instruct"
-      ])
-    ];
+    // Timeout
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 20000);
 
-    let response = null;
+    let response;
 
-    for (const model of chain) {
-      try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 20000);
-
-        const res = await callNVIDIA(
-          model,
-          messages,
-          body,
-          env,
-          controller.signal
-        );
-
-        clearTimeout(timeout);
-
-        if (res && res.ok && res.body) {
-          response = res;
-          break;
-        }
-      } catch {
-        continue;
-      }
+    try {
+      response = await callNVIDIA(
+        model,
+        messages,
+        body,
+        env,
+        controller.signal
+      );
+    } finally {
+      clearTimeout(timeout);
     }
 
-    if (!response) {
+    // Show real NVIDIA errors
+    if (!response || !response.ok || !response.body) {
+      let errorText = "Unknown error";
+
+      try {
+        errorText = await response.text();
+      } catch {}
+
+      console.log("NVIDIA ERROR:", response?.status, errorText);
+
       return new Response(
         JSON.stringify({
-          error: "All models failed (check API key or NVIDIA status)"
+          error: errorText,
+          status: response?.status ?? 500
         }),
         {
-          status: 500,
+          status: response?.status ?? 500,
           headers: {
             "Content-Type": "application/json",
             "Access-Control-Allow-Origin": "*"
@@ -134,7 +126,7 @@ export default {
       );
     }
 
-    // 🔥 STREAM PASS THROUGH
+    // Stream cleaner
     const { readable, writable } = new TransformStream();
     const writer = writable.getWriter();
     const reader = response.body.getReader();
@@ -178,7 +170,7 @@ export default {
         }
       }
 
-      writer.close();
+      await writer.close();
     })();
 
     return new Response(readable, {
