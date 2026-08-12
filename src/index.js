@@ -1,18 +1,19 @@
 const MODEL_MAP = {
   "llama-70b": "meta/llama-3.1-70b-instruct",
-  "deepseek-flash": "deepseek-ai/deepseek-v4-flash",
-  "deepseek-pro": "deepseek-ai/deepseek-v4-pro",
+  "deepseek-flash": "minimaxai/minimax-m3",
+  "deepseek-pro": "z-ai/glm-5.2",
   "mistral": "mistralai/mistral-large-3-675b-instruct-2512"
 };
 
-// Fallback only when the selected model fails
+// Fallbacks
 const FALLBACKS = {
-  "deepseek-ai/deepseek-v4-flash": [
+  "minimaxai/minimax-m3": [
+    "z-ai/glm-5.2",
     "meta/llama-3.1-70b-instruct"
   ],
 
-  "deepseek-ai/deepseek-v4-pro": [
-    "deepseek-ai/deepseek-v4-flash",
+  "z-ai/glm-5.2": [
+    "minimaxai/minimax-m3",
     "meta/llama-3.1-70b-instruct"
   ],
 
@@ -21,6 +22,7 @@ const FALLBACKS = {
   ],
 
   "mistralai/mistral-large-3-675b-instruct-2512": [
+    "minimaxai/minimax-m3",
     "meta/llama-3.1-70b-instruct"
   ]
 };
@@ -45,14 +47,7 @@ async function callNVIDIA(model, messages, body, env, signal) {
           body.max_tokens || 8024,
           8024
         ),
-        stream: true,
-
-        ...(model.includes("deepseek") && {
-          chat_template_kwargs: {
-            enable_thinking: true,
-            thinking: true
-          }
-        })
+        stream: true
       })
     }
   );
@@ -68,7 +63,8 @@ export default {
         headers: {
           "Access-Control-Allow-Origin": "*",
           "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type, Authorization"
+          "Access-Control-Allow-Headers":
+            "Content-Type, Authorization"
         }
       });
     }
@@ -92,7 +88,7 @@ export default {
       });
     }
 
-    // Parse JSON
+    // Parse request
     let body;
 
     try {
@@ -106,14 +102,15 @@ export default {
       });
     }
 
-    // DeepSeek Flash is the default
+    // Default to MiniMax M3
     const inputModel =
       body.model || "deepseek-flash";
 
     const primaryModel =
       MODEL_MAP[inputModel] ||
-      "deepseek-ai/deepseek-v4-flash";
+      "minimaxai/minimax-m3";
 
+    // Messages
     const messages =
       Array.isArray(body.messages) &&
       body.messages.length > 0
@@ -134,34 +131,41 @@ export default {
     let response = null;
     let lastError = null;
 
-    // Try primary + fallbacks
+    // Try primary model and fallbacks
     for (const model of chain) {
       try {
-        const controller = new AbortController();
+        const controller =
+          new AbortController();
 
-        const timeout = setTimeout(
-          () => controller.abort(),
-          25000
-        );
+        const timeout =
+          setTimeout(
+            () => controller.abort(),
+            25000
+          );
 
-        const res = await callNVIDIA(
-          model,
-          messages,
-          body,
-          env,
-          controller.signal
-        );
+        const res =
+          await callNVIDIA(
+            model,
+            messages,
+            body,
+            env,
+            controller.signal
+          );
 
         clearTimeout(timeout);
 
         if (res.ok && res.body) {
-          console.log("MODEL USED:", model);
+          console.log(
+            "MODEL USED:",
+            model
+          );
 
           response = res;
           break;
         }
 
-        const errorText = await res.text();
+        const errorText =
+          await res.text();
 
         lastError = {
           model,
@@ -179,7 +183,9 @@ export default {
       } catch (error) {
         lastError = {
           model,
-          error: error?.message || "Unknown error"
+          error:
+            error?.message ||
+            "Unknown error"
         };
 
         console.log(
@@ -190,27 +196,33 @@ export default {
       }
     }
 
-    // Everything failed
+    // All models failed
     if (!response || !response.body) {
       return new Response(
         JSON.stringify({
-          error: "All NVIDIA models failed",
+          error:
+            "All NVIDIA models failed",
           last_error: lastError,
           tried_models: chain
         }),
         {
           status: 500,
           headers: {
-            "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*"
+            "Content-Type":
+              "application/json",
+
+            "Access-Control-Allow-Origin":
+              "*"
           }
         }
       );
     }
 
-    // Stream NVIDIA response to JanitorAI
-    const { readable, writable } =
-      new TransformStream();
+    // Stream response to JanitorAI
+    const {
+      readable,
+      writable
+    } = new TransformStream();
 
     const writer =
       writable.getWriter();
@@ -229,8 +241,10 @@ export default {
         let buffer = "";
 
         while (true) {
-          const { done, value } =
-            await reader.read();
+          const {
+            done,
+            value
+          } = await reader.read();
 
           if (done) {
             break;
@@ -238,7 +252,9 @@ export default {
 
           buffer += decoder.decode(
             value,
-            { stream: true }
+            {
+              stream: true
+            }
           );
 
           const lines =
@@ -248,11 +264,19 @@ export default {
             lines.pop() || "";
 
           for (const line of lines) {
-            if (!line.startsWith("data: ")) {
+            if (
+              !line.startsWith(
+                "data: "
+              )
+            ) {
               continue;
             }
 
-            if (line.includes("[DONE]")) {
+            if (
+              line.includes(
+                "[DONE]"
+              )
+            ) {
               await writer.write(
                 encoder.encode(
                   "data: [DONE]\n\n"
@@ -268,18 +292,26 @@ export default {
                   line.slice(6)
                 );
 
-              // Hide DeepSeek reasoning from JanitorAI
+              // Remove reasoning fields if a model sends them
               if (
                 json.choices?.[0]?.delta
               ) {
-                delete json.choices[0]
+                delete json
+                  .choices[0]
                   .delta
                   .reasoning_content;
+
+                delete json
+                  .choices[0]
+                  .delta
+                  .reasoning;
               }
 
               await writer.write(
                 encoder.encode(
-                  `data: ${JSON.stringify(json)}\n\n`
+                  `data: ${JSON.stringify(
+                    json
+                  )}\n\n`
                 )
               );
 
@@ -293,32 +325,6 @@ export default {
           }
         }
 
-        // Process any remaining buffered data
-        if (buffer.startsWith("data: ")) {
-          try {
-            const json =
-              JSON.parse(
-                buffer.slice(6)
-              );
-
-            if (
-              json.choices?.[0]?.delta
-            ) {
-              delete json.choices[0]
-                .delta
-                .reasoning_content;
-            }
-
-            await writer.write(
-              encoder.encode(
-                `data: ${JSON.stringify(json)}\n\n`
-              )
-            );
-          } catch {
-            // Ignore incomplete final chunk
-          }
-        }
-
         await writer.close();
 
       } catch (error) {
@@ -328,25 +334,30 @@ export default {
         );
 
         try {
-          await writer.abort(error);
+          await writer.abort(
+            error
+          );
         } catch {}
       }
     })();
 
-    return new Response(readable, {
-      headers: {
-        "Content-Type":
-          "text/event-stream",
+    return new Response(
+      readable,
+      {
+        headers: {
+          "Content-Type":
+            "text/event-stream",
 
-        "Access-Control-Allow-Origin":
-          "*",
+          "Access-Control-Allow-Origin":
+            "*",
 
-        "Cache-Control":
-          "no-cache",
+          "Cache-Control":
+            "no-cache",
 
-        "X-Accel-Buffering":
-          "no"
+          "X-Accel-Buffering":
+            "no"
+        }
       }
-    });
+    );
   }
 };
