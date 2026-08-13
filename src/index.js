@@ -5,7 +5,6 @@ const MODEL_MAP = {
   "mistral": "mistralai/mistral-large-3-675b-instruct-2512"
 };
 
-// Fallbacks
 const FALLBACKS = {
   "minimaxai/minimax-m3": [
     "z-ai/glm-5.2",
@@ -42,11 +41,11 @@ async function callNVIDIA(model, messages, body, env, signal) {
       body: JSON.stringify({
         model,
         messages,
+
         temperature: body.temperature ?? 0.85,
-        max_tokens: Math.min(
-          body.max_tokens || 8024,
-          8024
-        ),
+
+        max_tokens: body.max_tokens ?? 8024,
+
         stream: true
       })
     }
@@ -102,7 +101,8 @@ export default {
       });
     }
 
-    // Default to MiniMax M3
+    // Keep JanitorAI's existing model name working.
+    // "deepseek-flash" now routes to MiniMax M3.
     const inputModel =
       body.model || "deepseek-flash";
 
@@ -110,7 +110,6 @@ export default {
       MODEL_MAP[inputModel] ||
       "minimaxai/minimax-m3";
 
-    // Messages
     const messages =
       Array.isArray(body.messages) &&
       body.messages.length > 0
@@ -122,7 +121,7 @@ export default {
             }
           ];
 
-    // Build fallback chain
+    // Primary model + fallbacks
     const chain = [
       primaryModel,
       ...(FALLBACKS[primaryModel] || [])
@@ -131,28 +130,32 @@ export default {
     let response = null;
     let lastError = null;
 
-    // Try primary model and fallbacks
+    // Try models
     for (const model of chain) {
       try {
         const controller =
           new AbortController();
 
-        const timeout =
-          setTimeout(
-            () => controller.abort(),
-            25000
-          );
+        // Give NVIDIA more time to start
+        // a long RP generation.
+        const timeout = setTimeout(
+          () => controller.abort(),
+          60000
+        );
 
-        const res =
-          await callNVIDIA(
+        let res;
+
+        try {
+          res = await callNVIDIA(
             model,
             messages,
             body,
             env,
             controller.signal
           );
-
-        clearTimeout(timeout);
+        } finally {
+          clearTimeout(timeout);
+        }
 
         if (res.ok && res.body) {
           console.log(
@@ -210,7 +213,6 @@ export default {
           headers: {
             "Content-Type":
               "application/json",
-
             "Access-Control-Allow-Origin":
               "*"
           }
@@ -218,7 +220,7 @@ export default {
       );
     }
 
-    // Stream response to JanitorAI
+    // Streaming response
     const {
       readable,
       writable
@@ -265,17 +267,13 @@ export default {
 
           for (const line of lines) {
             if (
-              !line.startsWith(
-                "data: "
-              )
+              !line.startsWith("data: ")
             ) {
               continue;
             }
 
             if (
-              line.includes(
-                "[DONE]"
-              )
+              line.includes("[DONE]")
             ) {
               await writer.write(
                 encoder.encode(
@@ -292,7 +290,8 @@ export default {
                   line.slice(6)
                 );
 
-              // Remove reasoning fields if a model sends them
+              // Don't expose reasoning
+              // fields to JanitorAI.
               if (
                 json.choices?.[0]?.delta
               ) {
@@ -334,9 +333,7 @@ export default {
         );
 
         try {
-          await writer.abort(
-            error
-          );
+          await writer.abort(error);
         } catch {}
       }
     })();
