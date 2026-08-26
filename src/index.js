@@ -9,34 +9,18 @@ var __name = (target, value) =>
 
 var MODEL_MAP = {
   "llama-70b": "deepseek-ai/deepseek-v4-flash-0731",
-
   "deepseek-flash": "minimaxai/minimax-m3",
-
-  "deepseek-pro": "z-ai/glm-5.2",
-
-  "mistral":
-    "mistralai/mistral-large-3-675b-instruct-2512"
+  "deepseek-pro": "deepseek-ai/deepseek-v4-flash-0731",
+  "mistral": "minimaxai/minimax-m3"
 };
 
 var FALLBACKS = {
   "minimaxai/minimax-m3": [
-    "deepseek-ai/deepseek-v4-flash-0731",
-    "z-ai/glm-5.2"
+    "deepseek-ai/deepseek-v4-flash-0731"
   ],
 
   "deepseek-ai/deepseek-v4-flash-0731": [
-    "minimaxai/minimax-m3",
-    "z-ai/glm-5.2"
-  ],
-
-  "z-ai/glm-5.2": [
-    "minimaxai/minimax-m3",
-    "deepseek-ai/deepseek-v4-flash-0731"
-  ],
-
-  "mistralai/mistral-large-3-675b-instruct-2512": [
-    "minimaxai/minimax-m3",
-    "deepseek-ai/deepseek-v4-flash-0731"
+    "minimaxai/minimax-m3"
   ]
 };
 
@@ -115,7 +99,7 @@ var index_default = {
       });
     }
 
-    // Parse request
+    // Parse JSON
     let body;
 
     try {
@@ -133,7 +117,7 @@ var index_default = {
       );
     }
 
-    // Default model
+    // Default to MiniMax M3
     const inputModel =
       body.model || "deepseek-flash";
 
@@ -152,7 +136,7 @@ var index_default = {
             }
           ];
 
-    // Primary + fallback chain
+    // Primary + one fallback
     const chain = [
       primaryModel,
       ...(FALLBACKS[primaryModel] || [])
@@ -161,13 +145,12 @@ var index_default = {
     let response = null;
     let lastError = null;
 
-    // Try each model
+    // Try models
     for (const model of chain) {
       try {
         const controller =
           new AbortController();
 
-        // 60 second connection timeout
         const timeout = setTimeout(
           () => controller.abort(),
           60000
@@ -259,7 +242,7 @@ var index_default = {
       );
     }
 
-    // Stream response
+    // Stream NVIDIA -> JanitorAI
     const {
       readable,
       writable
@@ -313,7 +296,6 @@ var index_default = {
               continue;
             }
 
-            // End of stream
             if (
               line.includes(
                 "[DONE]"
@@ -334,8 +316,7 @@ var index_default = {
                   line.slice(6)
                 );
 
-              // Hide reasoning fields
-              // from JanitorAI
+              // Hide reasoning from JanitorAI
               if (
                 json.choices?.[0]
                   ?.delta
@@ -409,5 +390,3 @@ var index_default = {
 export {
   index_default as default
 };
-
-//# sourceMappingURL=index.js.map
