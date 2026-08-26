@@ -1,32 +1,52 @@
-const MODEL_MAP = {
-  "llama-70b": "meta/llama-3.1-70b-instruct",
+var __defProp = Object.defineProperty;
+var __name = (target, value) =>
+  __defProp(target, "name", {
+    value,
+    configurable: true
+  });
+
+// src/index.js
+
+var MODEL_MAP = {
+  "llama-70b": "deepseek-ai/deepseek-v4-flash-0731",
+
   "deepseek-flash": "minimaxai/minimax-m3",
+
   "deepseek-pro": "z-ai/glm-5.2",
-  "mistral": "mistralai/mistral-large-3-675b-instruct-2512"
+
+  "mistral":
+    "mistralai/mistral-large-3-675b-instruct-2512"
 };
 
-const FALLBACKS = {
+var FALLBACKS = {
   "minimaxai/minimax-m3": [
-    "z-ai/glm-5.2",
-    "meta/llama-3.1-70b-instruct"
+    "deepseek-ai/deepseek-v4-flash-0731",
+    "z-ai/glm-5.2"
+  ],
+
+  "deepseek-ai/deepseek-v4-flash-0731": [
+    "minimaxai/minimax-m3",
+    "z-ai/glm-5.2"
   ],
 
   "z-ai/glm-5.2": [
     "minimaxai/minimax-m3",
-    "meta/llama-3.1-70b-instruct"
-  ],
-
-  "meta/llama-3.1-70b-instruct": [
-    "meta/llama-3.1-8b-instruct"
+    "deepseek-ai/deepseek-v4-flash-0731"
   ],
 
   "mistralai/mistral-large-3-675b-instruct-2512": [
     "minimaxai/minimax-m3",
-    "meta/llama-3.1-70b-instruct"
+    "deepseek-ai/deepseek-v4-flash-0731"
   ]
 };
 
-async function callNVIDIA(model, messages, body, env, signal) {
+async function callNVIDIA(
+  model,
+  messages,
+  body,
+  env,
+  signal
+) {
   return fetch(
     "https://integrate.api.nvidia.com/v1/chat/completions",
     {
@@ -42,9 +62,11 @@ async function callNVIDIA(model, messages, body, env, signal) {
         model,
         messages,
 
-        temperature: body.temperature ?? 0.85,
+        temperature:
+          body.temperature ?? 0.85,
 
-        max_tokens: body.max_tokens ?? 8024,
+        max_tokens:
+          body.max_tokens ?? 8024,
 
         stream: true
       })
@@ -52,7 +74,9 @@ async function callNVIDIA(model, messages, body, env, signal) {
   );
 }
 
-export default {
+__name(callNVIDIA, "callNVIDIA");
+
+var index_default = {
   async fetch(request, env) {
     const url = new URL(request.url);
 
@@ -61,7 +85,8 @@ export default {
       return new Response(null, {
         headers: {
           "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+          "Access-Control-Allow-Methods":
+            "POST, GET, OPTIONS",
           "Access-Control-Allow-Headers":
             "Content-Type, Authorization"
         }
@@ -78,7 +103,10 @@ export default {
     }
 
     // JanitorAI endpoint
-    if (url.pathname !== "/v1/chat/completions") {
+    if (
+      url.pathname !==
+      "/v1/chat/completions"
+    ) {
       return new Response("Not Found", {
         status: 404,
         headers: {
@@ -93,16 +121,19 @@ export default {
     try {
       body = await request.json();
     } catch {
-      return new Response("Invalid JSON", {
-        status: 400,
-        headers: {
-          "Access-Control-Allow-Origin": "*"
+      return new Response(
+        "Invalid JSON",
+        {
+          status: 400,
+          headers: {
+            "Access-Control-Allow-Origin":
+              "*"
+          }
         }
-      });
+      );
     }
 
-    // Keep JanitorAI's existing model name working.
-    // "deepseek-flash" now routes to MiniMax M3.
+    // Default model
     const inputModel =
       body.model || "deepseek-flash";
 
@@ -121,7 +152,7 @@ export default {
             }
           ];
 
-    // Primary model + fallbacks
+    // Primary + fallback chain
     const chain = [
       primaryModel,
       ...(FALLBACKS[primaryModel] || [])
@@ -130,14 +161,13 @@ export default {
     let response = null;
     let lastError = null;
 
-    // Try models
+    // Try each model
     for (const model of chain) {
       try {
         const controller =
           new AbortController();
 
-        // Give NVIDIA more time to start
-        // a long RP generation.
+        // 60 second connection timeout
         const timeout = setTimeout(
           () => controller.abort(),
           60000
@@ -199,20 +229,29 @@ export default {
       }
     }
 
-    // All models failed
-    if (!response || !response.body) {
+    // Everything failed
+    if (
+      !response ||
+      !response.body
+    ) {
       return new Response(
         JSON.stringify({
           error:
             "All NVIDIA models failed",
-          last_error: lastError,
-          tried_models: chain
+
+          last_error:
+            lastError,
+
+          tried_models:
+            chain
         }),
         {
           status: 500,
+
           headers: {
             "Content-Type":
               "application/json",
+
             "Access-Control-Allow-Origin":
               "*"
           }
@@ -220,7 +259,7 @@ export default {
       );
     }
 
-    // Streaming response
+    // Stream response
     const {
       readable,
       writable
@@ -267,13 +306,18 @@ export default {
 
           for (const line of lines) {
             if (
-              !line.startsWith("data: ")
+              !line.startsWith(
+                "data: "
+              )
             ) {
               continue;
             }
 
+            // End of stream
             if (
-              line.includes("[DONE]")
+              line.includes(
+                "[DONE]"
+              )
             ) {
               await writer.write(
                 encoder.encode(
@@ -290,10 +334,11 @@ export default {
                   line.slice(6)
                 );
 
-              // Don't expose reasoning
-              // fields to JanitorAI.
+              // Hide reasoning fields
+              // from JanitorAI
               if (
-                json.choices?.[0]?.delta
+                json.choices?.[0]
+                  ?.delta
               ) {
                 delete json
                   .choices[0]
@@ -333,7 +378,9 @@ export default {
         );
 
         try {
-          await writer.abort(error);
+          await writer.abort(
+            error
+          );
         } catch {}
       }
     })();
@@ -358,3 +405,9 @@ export default {
     );
   }
 };
+
+export {
+  index_default as default
+};
+
+//# sourceMappingURL=index.js.map
