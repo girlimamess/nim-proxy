@@ -9,18 +9,18 @@ var __name = (target, value) =>
 
 var MODEL_MAP = {
   "llama-70b": "deepseek-ai/deepseek-v4-flash-0731",
-  "deepseek-flash": "minimaxai/minimax-m3",
-  "deepseek-pro": "deepseek-ai/deepseek-v4-flash-0731",
+  "deepseek-flash": "deepseek-ai/deepseek-v4-flash-0731",
+  "deepseek-pro": "minimaxai/minimax-m3",
   "mistral": "minimaxai/minimax-m3"
 };
 
 var FALLBACKS = {
-  "minimaxai/minimax-m3": [
-    "deepseek-ai/deepseek-v4-flash-0731"
-  ],
-
   "deepseek-ai/deepseek-v4-flash-0731": [
     "minimaxai/minimax-m3"
+  ],
+
+  "minimaxai/minimax-m3": [
+    "deepseek-ai/deepseek-v4-flash-0731"
   ]
 };
 
@@ -50,7 +50,10 @@ async function callNVIDIA(
           body.temperature ?? 0.85,
 
         max_tokens:
-          body.max_tokens ?? 8024,
+          Math.min(
+            body.max_tokens ?? 8024,
+            8024
+          ),
 
         stream: true
       })
@@ -99,7 +102,7 @@ var index_default = {
       });
     }
 
-    // Parse JSON
+    // Parse request
     let body;
 
     try {
@@ -110,20 +113,19 @@ var index_default = {
         {
           status: 400,
           headers: {
-            "Access-Control-Allow-Origin":
-              "*"
+            "Access-Control-Allow-Origin": "*"
           }
         }
       );
     }
 
-    // Default to MiniMax M3
+    // DeepSeek V4 Flash 0731 is the default
     const inputModel =
       body.model || "deepseek-flash";
 
     const primaryModel =
       MODEL_MAP[inputModel] ||
-      "minimaxai/minimax-m3";
+      "deepseek-ai/deepseek-v4-flash-0731";
 
     const messages =
       Array.isArray(body.messages) &&
@@ -136,7 +138,7 @@ var index_default = {
             }
           ];
 
-    // Primary + one fallback
+    // Primary + fallback
     const chain = [
       primaryModel,
       ...(FALLBACKS[primaryModel] || [])
@@ -145,9 +147,14 @@ var index_default = {
     let response = null;
     let lastError = null;
 
-    // Try models
+    // Try models in order
     for (const model of chain) {
       try {
+        console.log(
+          "TRYING MODEL:",
+          model
+        );
+
         const controller =
           new AbortController();
 
@@ -212,7 +219,7 @@ var index_default = {
       }
     }
 
-    // Everything failed
+    // All models failed
     if (
       !response ||
       !response.body
@@ -242,7 +249,7 @@ var index_default = {
       );
     }
 
-    // Stream NVIDIA -> JanitorAI
+    // Stream NVIDIA response to JanitorAI
     const {
       readable,
       writable
@@ -296,6 +303,7 @@ var index_default = {
               continue;
             }
 
+            // End of stream
             if (
               line.includes(
                 "[DONE]"
@@ -316,7 +324,8 @@ var index_default = {
                   line.slice(6)
                 );
 
-              // Hide reasoning from JanitorAI
+              // Hide reasoning fields
+              // from JanitorAI
               if (
                 json.choices?.[0]
                   ?.delta
