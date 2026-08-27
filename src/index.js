@@ -7,12 +7,18 @@ var __name = (target, value) =>
 
 // src/index.js
 
+// ============================================================
+// MODELS
+// ============================================================
+
 var MODEL_MAP = {
-  "llama-70b": "deepseek-ai/deepseek-v4-flash-0731",
   "deepseek-flash": "deepseek-ai/deepseek-v4-flash-0731",
-  "deepseek-pro": "minimaxai/minimax-m3",
-  "mistral": "minimaxai/minimax-m3"
+  "minimax": "minimaxai/minimax-m3"
 };
+
+// ============================================================
+// FALLBACKS
+// ============================================================
 
 var FALLBACKS = {
   "deepseek-ai/deepseek-v4-flash-0731": [
@@ -23,6 +29,10 @@ var FALLBACKS = {
     "deepseek-ai/deepseek-v4-flash-0731"
   ]
 };
+
+// ============================================================
+// NVIDIA REQUEST
+// ============================================================
 
 async function callNVIDIA(
   model,
@@ -35,6 +45,7 @@ async function callNVIDIA(
     "https://integrate.api.nvidia.com/v1/chat/completions",
     {
       method: "POST",
+
       signal,
 
       headers: {
@@ -44,6 +55,7 @@ async function callNVIDIA(
 
       body: JSON.stringify({
         model,
+
         messages,
 
         temperature:
@@ -51,7 +63,7 @@ async function callNVIDIA(
 
         max_tokens:
           Math.min(
-            body.max_tokens ?? 8024,
+            body.max_tokens || 8024,
             8024
           ),
 
@@ -63,74 +75,257 @@ async function callNVIDIA(
 
 __name(callNVIDIA, "callNVIDIA");
 
+// ============================================================
+// SLEEP
+// ============================================================
+
+function sleep(ms) {
+  return new Promise(
+    (resolve) => setTimeout(resolve, ms)
+  );
+}
+
+__name(sleep, "sleep");
+
+// ============================================================
+// RETRY-AFTER
+// ============================================================
+
+function getRetryAfterMs(response) {
+  if (!response) {
+    return 0;
+  }
+
+  const retryAfter =
+    response.headers.get("Retry-After");
+
+  if (!retryAfter) {
+    return 0;
+  }
+
+  // Retry-After can be seconds
+  const seconds =
+    Number(retryAfter);
+
+  if (
+    Number.isFinite(seconds) &&
+    seconds >= 0
+  ) {
+    return Math.min(
+      seconds * 1000,
+      30000
+    );
+  }
+
+  // Or an HTTP date
+  const date =
+    Date.parse(retryAfter);
+
+  if (!Number.isNaN(date)) {
+    return Math.max(
+      0,
+      Math.min(
+        date - Date.now(),
+        30000
+      )
+    );
+  }
+
+  return 0;
+}
+
+__name(
+  getRetryAfterMs,
+  "getRetryAfterMs"
+);
+
+// ============================================================
+// BACKOFF
+// ============================================================
+
+async function rateLimitBackoff(
+  response,
+  attempt
+) {
+  const retryAfter =
+    getRetryAfterMs(response);
+
+  if (retryAfter > 0) {
+    console.log(
+      "429 RETRY-AFTER:",
+      retryAfter,
+      "ms"
+    );
+
+    await sleep(retryAfter);
+
+    return;
+  }
+
+  // Conservative exponential backoff
+  const base =
+    Math.min(
+      2000 *
+        Math.pow(
+          2,
+          attempt
+        ),
+      10000
+    );
+
+  // Small random jitter
+  const jitter =
+    Math.floor(
+      Math.random() * 1000
+    );
+
+  const delay =
+    base + jitter;
+
+  console.log(
+    "429 BACKOFF:",
+    delay,
+    "ms"
+  );
+
+  await sleep(delay);
+}
+
+__name(
+  rateLimitBackoff,
+  "rateLimitBackoff"
+);
+
+// ============================================================
+// WORKER
+// ============================================================
+
 var index_default = {
-  async fetch(request, env) {
-    const url = new URL(request.url);
 
+  async fetch(
+    request,
+    env
+  ) {
+
+    const url =
+      new URL(request.url);
+
+    // ========================================================
     // CORS
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods":
-            "POST, GET, OPTIONS",
-          "Access-Control-Allow-Headers":
-            "Content-Type, Authorization"
-        }
-      });
-    }
+    // ========================================================
 
-    // Health check
-    if (url.pathname === "/health") {
-      return new Response("OK", {
-        headers: {
-          "Access-Control-Allow-Origin": "*"
-        }
-      });
-    }
-
-    // JanitorAI endpoint
     if (
-      url.pathname !==
-      "/v1/chat/completions"
+      request.method === "OPTIONS"
     ) {
-      return new Response("Not Found", {
-        status: 404,
-        headers: {
-          "Access-Control-Allow-Origin": "*"
-        }
-      });
-    }
 
-    // Parse request
-    let body;
-
-    try {
-      body = await request.json();
-    } catch {
       return new Response(
-        "Invalid JSON",
+        null,
         {
-          status: 400,
           headers: {
-            "Access-Control-Allow-Origin": "*"
+            "Access-Control-Allow-Origin":
+              "*",
+
+            "Access-Control-Allow-Methods":
+              "POST, GET, OPTIONS",
+
+            "Access-Control-Allow-Headers":
+              "Content-Type, Authorization"
           }
         }
       );
     }
 
-    // DeepSeek V4 Flash 0731 is the default
+    // ========================================================
+    // HEALTH
+    // ========================================================
+
+    if (
+      url.pathname === "/health"
+    ) {
+
+      return new Response(
+        "OK",
+        {
+          headers: {
+            "Access-Control-Allow-Origin":
+              "*"
+          }
+        }
+      );
+    }
+
+    // ========================================================
+    // JANITORAI ENDPOINT
+    // ========================================================
+
+    if (
+      url.pathname !==
+      "/v1/chat/completions"
+    ) {
+
+      return new Response(
+        "Not Found",
+        {
+          status: 404,
+
+          headers: {
+            "Access-Control-Allow-Origin":
+              "*"
+          }
+        }
+      );
+    }
+
+    // ========================================================
+    // PARSE BODY
+    // ========================================================
+
+    let body;
+
+    try {
+
+      body =
+        await request.json();
+
+    } catch {
+
+      return new Response(
+        "Invalid JSON",
+        {
+          status: 400,
+
+          headers: {
+            "Access-Control-Allow-Origin":
+              "*"
+          }
+        }
+      );
+    }
+
+    // ========================================================
+    // MODEL
+    // ========================================================
+
     const inputModel =
-      body.model || "deepseek-flash";
+      body.model ||
+      "deepseek-flash";
 
     const primaryModel =
       MODEL_MAP[inputModel] ||
       "deepseek-ai/deepseek-v4-flash-0731";
 
+    // ========================================================
+    // MESSAGES
+    // ========================================================
+
     const messages =
-      Array.isArray(body.messages) &&
+      Array.isArray(
+        body.messages
+      ) &&
       body.messages.length > 0
+
         ? body.messages
+
         : [
             {
               role: "user",
@@ -138,54 +333,138 @@ var index_default = {
             }
           ];
 
-    // Primary + fallback
+    // ========================================================
+    // BUILD MODEL CHAIN
+    // ========================================================
+
     const chain = [
       primaryModel,
-      ...(FALLBACKS[primaryModel] || [])
+      ...(FALLBACKS[
+        primaryModel
+      ] || [])
     ];
 
+    console.log(
+      "MODEL CHAIN:",
+      chain
+    );
+
+    // ========================================================
+    // TRY MODELS
+    // ========================================================
+
     let response = null;
+
     let lastError = null;
 
-    // Try models in order
-    for (const model of chain) {
+    for (
+      let modelIndex = 0;
+      modelIndex < chain.length;
+      modelIndex++
+    ) {
+
+      const model =
+        chain[modelIndex];
+
       try {
-        console.log(
-          "TRYING MODEL:",
-          model
-        );
+
+        // ----------------------------------------------------
+        // Only one attempt per model.
+        // If NVIDIA says 429, we back off once and then
+        // move to the fallback rather than hammering it.
+        // ----------------------------------------------------
 
         const controller =
           new AbortController();
 
-        const timeout = setTimeout(
-          () => controller.abort(),
-          60000
-        );
+        const timeout =
+          setTimeout(
+            () =>
+              controller.abort(),
+            60000
+          );
 
         let res;
 
         try {
-          res = await callNVIDIA(
-            model,
-            messages,
-            body,
-            env,
-            controller.signal
-          );
+
+          res =
+            await callNVIDIA(
+              model,
+              messages,
+              body,
+              env,
+              controller.signal
+            );
+
         } finally {
-          clearTimeout(timeout);
+
+          clearTimeout(
+            timeout
+          );
         }
 
-        if (res.ok && res.body) {
+        // ----------------------------------------------------
+        // SUCCESS
+        // ----------------------------------------------------
+
+        if (
+          res.ok &&
+          res.body
+        ) {
+
           console.log(
             "MODEL USED:",
             model
           );
 
           response = res;
+
           break;
         }
+
+        // ----------------------------------------------------
+        // 429 RATE LIMIT
+        // ----------------------------------------------------
+
+        if (
+          res.status === 429
+        ) {
+
+          const errorText =
+            await res.text();
+
+          console.log(
+            "RATE LIMITED:",
+            model,
+            errorText
+          );
+
+          lastError = {
+            model,
+            status: 429,
+            error: errorText
+          };
+
+          // If there is another model,
+          // wait briefly before switching.
+          if (
+            modelIndex <
+            chain.length - 1
+          ) {
+
+            await rateLimitBackoff(
+              res,
+              0
+            );
+          }
+
+          continue;
+        }
+
+        // ----------------------------------------------------
+        // OTHER ERROR
+        // ----------------------------------------------------
 
         const errorText =
           await res.text();
@@ -204,8 +483,10 @@ var index_default = {
         );
 
       } catch (error) {
+
         lastError = {
           model,
+
           error:
             error?.message ||
             "Unknown error"
@@ -219,13 +500,19 @@ var index_default = {
       }
     }
 
-    // All models failed
+    // ========================================================
+    // EVERYTHING FAILED
+    // ========================================================
+
     if (
       !response ||
       !response.body
     ) {
+
       return new Response(
+
         JSON.stringify({
+
           error:
             "All NVIDIA models failed",
 
@@ -235,6 +522,7 @@ var index_default = {
           tried_models:
             chain
         }),
+
         {
           status: 500,
 
@@ -249,11 +537,15 @@ var index_default = {
       );
     }
 
-    // Stream NVIDIA response to JanitorAI
+    // ========================================================
+    // STREAM RESPONSE
+    // ========================================================
+
     const {
       readable,
       writable
-    } = new TransformStream();
+    } =
+      new TransformStream();
 
     const writer =
       writable.getWriter();
@@ -267,26 +559,35 @@ var index_default = {
     const encoder =
       new TextEncoder();
 
+    // ========================================================
+    // STREAM PROCESSOR
+    // ========================================================
+
     (async () => {
+
       try {
+
         let buffer = "";
 
         while (true) {
+
           const {
             done,
             value
-          } = await reader.read();
+          } =
+            await reader.read();
 
           if (done) {
             break;
           }
 
-          buffer += decoder.decode(
-            value,
-            {
-              stream: true
-            }
-          );
+          buffer +=
+            decoder.decode(
+              value,
+              {
+                stream: true
+              }
+            );
 
           const lines =
             buffer.split("\n");
@@ -294,7 +595,11 @@ var index_default = {
           buffer =
             lines.pop() || "";
 
-          for (const line of lines) {
+          for (
+            const line
+            of lines
+          ) {
+
             if (
               !line.startsWith(
                 "data: "
@@ -303,12 +608,16 @@ var index_default = {
               continue;
             }
 
-            // End of stream
+            // ------------------------------------------------
+            // DONE
+            // ------------------------------------------------
+
             if (
               line.includes(
                 "[DONE]"
               )
             ) {
+
               await writer.write(
                 encoder.encode(
                   "data: [DONE]\n\n"
@@ -318,18 +627,24 @@ var index_default = {
               continue;
             }
 
+            // ------------------------------------------------
+            // JSON
+            // ------------------------------------------------
+
             try {
+
               const json =
                 JSON.parse(
                   line.slice(6)
                 );
 
-              // Hide reasoning fields
-              // from JanitorAI
+              // Hide internal reasoning
+              // from JanitorAI.
+
               if (
-                json.choices?.[0]
-                  ?.delta
+                json.choices?.[0]?.delta
               ) {
+
                 delete json
                   .choices[0]
                   .delta
@@ -342,18 +657,25 @@ var index_default = {
               }
 
               await writer.write(
+
                 encoder.encode(
+
                   `data: ${JSON.stringify(
                     json
                   )}\n\n`
+
                 )
+
               );
 
             } catch {
+
               await writer.write(
+
                 encoder.encode(
                   line + "\n\n"
                 )
+
               );
             }
           }
@@ -362,23 +684,33 @@ var index_default = {
         await writer.close();
 
       } catch (error) {
+
         console.log(
           "STREAM ERROR:",
           error?.message
         );
 
         try {
+
           await writer.abort(
             error
           );
-        } catch {}
+
+        } catch {
+        }
       }
+
     })();
+
+    // ========================================================
+    // RETURN STREAM
+    // ========================================================
 
     return new Response(
       readable,
       {
         headers: {
+
           "Content-Type":
             "text/event-stream",
 
@@ -399,3 +731,5 @@ var index_default = {
 export {
   index_default as default
 };
+
+//# sourceMappingURL=index.js.map
