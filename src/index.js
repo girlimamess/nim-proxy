@@ -1,390 +1,313 @@
-const MODEL_MAP = {
-  "minimax": "minimaxai/minimax-m3",
-  "deepseek-flash": "deepseek-ai/deepseek-v4-flash-0731"
-};
+const MODEL = "moonshotai/kimi-k3";
 
-const FALLBACKS = {
-  "minimaxai/minimax-m3": [
-    "deepseek-ai/deepseek-v4-flash-0731"
-  ],
+const NVIDIA_URL =
+  "https://integrate.api.nvidia.com/v1/chat/completions";
 
-  "deepseek-ai/deepseek-v4-flash-0731": [
-    "minimaxai/minimax-m3"
-  ]
-};
+function corsHeaders() {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Max-Age": "86400"
+  };
+}
 
-async function callNVIDIA(model, messages, body, env, signal) {
-  return fetch(
-    "https://integrate.api.nvidia.com/v1/chat/completions",
-    {
-      method: "POST",
-      signal,
-      headers: {
-        Authorization: `Bearer ${env.NIM_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model,
-        messages,
-        temperature: body.temperature ?? 0.85,
-        max_tokens: Math.min(
-          body.max_tokens || 8024,
-          8024
-        ),
-        stream: true
-      })
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      ...corsHeaders(),
+      "Content-Type": "application/json; charset=utf-8"
     }
-  );
-}
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function getRetryAfterMs(response) {
-  if (!response) {
-    return 0;
-  }
-
-  const retryAfter = response.headers.get("Retry-After");
-
-  if (!retryAfter) {
-    return 0;
-  }
-
-  const seconds = Number(retryAfter);
-
-  if (Number.isFinite(seconds) && seconds >= 0) {
-    return Math.min(seconds * 1000, 30000);
-  }
-
-  const date = Date.parse(retryAfter);
-
-  if (!Number.isNaN(date)) {
-    return Math.max(
-      0,
-      Math.min(date - Date.now(), 30000)
-    );
-  }
-
-  return 0;
-}
-
-async function rateLimitBackoff(response, attempt) {
-  const retryAfter = getRetryAfterMs(response);
-
-  if (retryAfter > 0) {
-    console.log(
-      "429 RETRY-AFTER:",
-      retryAfter,
-      "ms"
-    );
-
-    await sleep(retryAfter);
-    return;
-  }
-
-  const base = Math.min(
-    2000 * Math.pow(2, attempt),
-    10000
-  );
-
-  const jitter = Math.floor(
-    Math.random() * 1000
-  );
-
-  const delay = base + jitter;
-
-  console.log(
-    "429 BACKOFF:",
-    delay,
-    "ms"
-  );
-
-  await sleep(delay);
+  });
 }
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // CORS
+    // CORS preflight
     if (request.method === "OPTIONS") {
       return new Response(null, {
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods":
-            "POST, GET, OPTIONS",
-          "Access-Control-Allow-Headers":
-            "Content-Type, Authorization"
-        }
+        status: 204,
+        headers: corsHeaders()
       });
     }
 
     // Health check
     if (url.pathname === "/health") {
       return new Response("OK", {
-        headers: {
-          "Access-Control-Allow-Origin": "*"
-        }
+        status: 200,
+        headers: corsHeaders()
       });
     }
 
-    // JanitorAI OpenAI-compatible endpoint
+    // Simple Kimi test
+    if (url.pathname === "/test") {
+      try {
+        const response = await fetch(NVIDIA_URL, {
+          method: "POST",
+          headers: {
+            "Authorization": "Bearer " + env.NIM_API_KEY,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            model: MODEL,
+            messages: [
+              {
+                role: "user",
+                content: "Reply with exactly: Kimi K3 is working."
+              }
+            ],
+            temperature: 0.7,
+            max_tokens: 30,
+            stream: false
+          })
+        });
+
+        const text = await response.text();
+
+        return new Response(
+          "MODEL: " + MODEL +
+          "\nNVIDIA STATUS: " + response.status +
+          "\n\n" + text,
+          {
+            status: 200,
+            headers: {
+              ...corsHeaders(),
+              "Content-Type": "text/plain; charset=utf-8"
+            }
+          }
+        );
+      } catch (error) {
+        return new Response(
+          "NVIDIA FETCH ERROR:\n" +
+          (error?.message || String(error)),
+          {
+            status: 502,
+            headers: {
+              ...corsHeaders(),
+              "Content-Type": "text/plain; charset=utf-8"
+            }
+          }
+        );
+      }
+    }
+
+    // JanitorAI endpoint
     if (url.pathname !== "/v1/chat/completions") {
       return new Response("Not Found", {
         status: 404,
-        headers: {
-          "Access-Control-Allow-Origin": "*"
-        }
+        headers: corsHeaders()
       });
     }
 
-    // Parse request
+    if (request.method !== "POST") {
+      return jsonResponse(
+        { error: "Method not allowed" },
+        405
+      );
+    }
+
     let body;
 
     try {
       body = await request.json();
     } catch {
-      return new Response("Invalid JSON", {
-        status: 400,
-        headers: {
-          "Access-Control-Allow-Origin": "*"
-        }
-      });
+      return jsonResponse(
+        { error: "Invalid JSON request body" },
+        400
+      );
     }
 
-    /*
-     * MiniMax is now the DEFAULT.
-     *
-     * If JanitorAI doesn't specify a model,
-     * MiniMax M3 is used.
-     */
-    const inputModel =
-      body.model || "minimax";
+    if (
+      !Array.isArray(body.messages) ||
+      body.messages.length === 0
+    ) {
+      return jsonResponse(
+        { error: "messages is required" },
+        400
+      );
+    }
 
-    const primaryModel =
-      MODEL_MAP[inputModel] ||
-      "minimaxai/minimax-m3";
+    // Keep generation settings suitable for RP.
+    const temperature =
+      typeof body.temperature === "number"
+        ? body.temperature
+        : 0.85;
 
-    const messages =
-      Array.isArray(body.messages) &&
-      body.messages.length > 0
-        ? body.messages
-        : [
-            {
-              role: "user",
-              content: "Hello"
-            }
-          ];
-
-    // Build model chain
-    const chain = [
-      primaryModel,
-      ...(FALLBACKS[primaryModel] || [])
-    ];
-
-    console.log(
-      "MODEL CHAIN:",
-      chain
+    const maxTokens = Math.min(
+      typeof body.max_tokens === "number"
+        ? body.max_tokens
+        : 8192,
+      8192
     );
 
-    let response = null;
-    let lastError = null;
+    const stream =
+      body.stream !== false;
 
-    // Try primary model, then fallback
-    for (
-      let modelIndex = 0;
-      modelIndex < chain.length;
-      modelIndex++
-    ) {
-      const model = chain[modelIndex];
+    console.log(
+      "JANITOR REQUEST:",
+      "model=" + MODEL,
+      "messages=" + body.messages.length,
+      "stream=" + stream,
+      "max_tokens=" + maxTokens
+    );
 
-      try {
-        const controller =
-          new AbortController();
+    let response;
 
-        const timeout = setTimeout(
-          () => controller.abort(),
-          60000
-        );
+    try {
+      response = await fetch(NVIDIA_URL, {
+        method: "POST",
+        headers: {
+          "Authorization": "Bearer " + env.NIM_API_KEY,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model: MODEL,
+          messages: body.messages,
+          temperature,
+          max_tokens: maxTokens,
+          top_p:
+            typeof body.top_p === "number"
+              ? body.top_p
+              : 0.95,
+          stream
+        })
+      });
+    } catch (error) {
+      console.log(
+        "NVIDIA FETCH ERROR:",
+        error?.message || String(error)
+      );
 
-        let res;
-
-        try {
-          res = await callNVIDIA(
-            model,
-            messages,
-            body,
-            env,
-            controller.signal
-          );
-        } finally {
-          clearTimeout(timeout);
-        }
-
-        // Successful response
-        if (res.ok && res.body) {
-          console.log(
-            "MODEL USED:",
-            model
-          );
-
-          response = res;
-          break;
-        }
-
-        // Rate limited
-        if (res.status === 429) {
-          const errorText =
-            await res.text();
-
-          console.log(
-            "RATE LIMITED:",
-            model,
-            errorText
-          );
-
-          lastError = {
-            model,
-            status: 429,
-            error: errorText
-          };
-
-          /*
-           * Wait before trying the fallback.
-           * Only do this if another model exists.
-           */
-          if (
-            modelIndex <
-            chain.length - 1
-          ) {
-            await rateLimitBackoff(
-              res,
-              0
-            );
-          }
-
-          continue;
-        }
-
-        // Other NVIDIA error
-        const errorText =
-          await res.text();
-
-        lastError = {
-          model,
-          status: res.status,
-          error: errorText
-        };
-
-        console.log(
-          "MODEL FAILED:",
-          model,
-          res.status,
-          errorText
-        );
-
-      } catch (error) {
-        lastError = {
-          model,
-          error:
-            error?.message ||
-            "Unknown error"
-        };
-
-        console.log(
-          "MODEL ERROR:",
-          model,
-          error?.message
-        );
-      }
+      return jsonResponse(
+        {
+          error: "NVIDIA connection failed",
+          model: MODEL,
+          message:
+            error?.message || "Unknown connection error"
+        },
+        502
+      );
     }
 
-    // Everything failed
-    if (!response || !response.body) {
+    console.log(
+      "NVIDIA STATUS:",
+      response.status
+    );
+
+    // Rate limit: do NOT automatically retry/fallback.
+    if (response.status === 429) {
+      const errorText = await response.text();
+
+      const headers = {
+        ...corsHeaders(),
+        "Content-Type": "application/json; charset=utf-8"
+      };
+
+      const retryAfter =
+        response.headers.get("Retry-After");
+
+      if (retryAfter) {
+        headers["Retry-After"] = retryAfter;
+      }
+
       return new Response(
         JSON.stringify({
-          error:
-            "All NVIDIA models failed",
-          last_error: lastError,
-          tried_models: chain
+          error: "NVIDIA rate limit reached",
+          model: MODEL,
+          details: errorText
         }),
         {
-          status: 500,
-          headers: {
-            "Content-Type":
-              "application/json",
-            "Access-Control-Allow-Origin":
-              "*"
-          }
+          status: 429,
+          headers
         }
       );
     }
 
-    /*
-     * Stream NVIDIA's response directly
-     * back to JanitorAI.
-     */
-    const {
-      readable,
-      writable
-    } = new TransformStream();
+    // Other NVIDIA errors
+    if (!response.ok) {
+      const errorText = await response.text();
 
-    const writer =
-      writable.getWriter();
+      console.log(
+        "NVIDIA ERROR:",
+        response.status,
+        errorText
+      );
 
-    const reader =
-      response.body.getReader();
+      return jsonResponse(
+        {
+          error: "NVIDIA returned an error",
+          status: response.status,
+          model: MODEL,
+          details: errorText
+        },
+        response.status
+      );
+    }
 
-    const decoder =
-      new TextDecoder();
+    // Non-streaming response
+    if (!stream) {
+      const text = await response.text();
 
-    const encoder =
-      new TextEncoder();
+      return new Response(text, {
+        status: 200,
+        headers: {
+          ...corsHeaders(),
+          "Content-Type": "application/json; charset=utf-8"
+        }
+      });
+    }
+
+    if (!response.body) {
+      return jsonResponse(
+        {
+          error: "NVIDIA returned no response body",
+          model: MODEL
+        },
+        502
+      );
+    }
+
+    // Stream NVIDIA → JanitorAI
+    const { readable, writable } =
+      new TransformStream();
+
+    const writer = writable.getWriter();
+    const reader = response.body.getReader();
+
+    const decoder = new TextDecoder();
+    const encoder = new TextEncoder();
 
     (async () => {
-      try {
-        let buffer = "";
+      let buffer = "";
 
+      try {
         while (true) {
-          const {
-            done,
-            value
-          } = await reader.read();
+          const { done, value } =
+            await reader.read();
 
           if (done) {
             break;
           }
 
-          buffer += decoder.decode(
-            value,
-            {
-              stream: true
-            }
-          );
+          buffer += decoder.decode(value, {
+            stream: true
+          });
 
-          const lines =
-            buffer.split("\n");
+          const lines = buffer.split("\n");
 
-          buffer =
-            lines.pop() || "";
+          buffer = lines.pop() || "";
 
           for (const line of lines) {
-            if (
-              !line.startsWith(
-                "data: "
-              )
-            ) {
+            if (!line.startsWith("data: ")) {
               continue;
             }
 
-            // End of stream
-            if (
-              line.includes(
-                "[DONE]"
-              )
-            ) {
+            const payload = line.slice(6);
+
+            if (payload === "[DONE]") {
               await writer.write(
                 encoder.encode(
                   "data: [DONE]\n\n"
@@ -395,37 +318,26 @@ export default {
             }
 
             try {
-              const json =
-                JSON.parse(
-                  line.slice(6)
-                );
+              const json = JSON.parse(payload);
 
-              /*
-               * Remove internal reasoning
-               * fields before JanitorAI receives them.
-               */
-              if (
-                json.choices?.[0]?.delta
-              ) {
-                delete json
-                  .choices[0]
-                  .delta
-                  .reasoning_content;
+              const delta =
+                json.choices?.[0]?.delta;
 
-                delete json
-                  .choices[0]
-                  .delta
-                  .reasoning;
+              if (delta) {
+                // Prevent reasoning from appearing
+                // as visible RP text.
+                delete delta.reasoning_content;
+                delete delta.reasoning;
+                delete delta.thinking;
               }
 
               await writer.write(
                 encoder.encode(
-                  `data: ${JSON.stringify(
-                    json
-                  )}\n\n`
+                  "data: " +
+                  JSON.stringify(json) +
+                  "\n\n"
                 )
               );
-
             } catch {
               await writer.write(
                 encoder.encode(
@@ -441,34 +353,23 @@ export default {
       } catch (error) {
         console.log(
           "STREAM ERROR:",
-          error?.message
+          error?.message || String(error)
         );
 
         try {
-          await writer.abort(
-            error
-          );
+          await writer.abort(error);
         } catch {}
       }
     })();
 
-    return new Response(
-      readable,
-      {
-        headers: {
-          "Content-Type":
-            "text/event-stream",
-
-          "Access-Control-Allow-Origin":
-            "*",
-
-          "Cache-Control":
-            "no-cache",
-
-          "X-Accel-Buffering":
-            "no"
-        }
+    return new Response(readable, {
+      status: 200,
+      headers: {
+        ...corsHeaders(),
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no"
       }
-    );
+    });
   }
 };
