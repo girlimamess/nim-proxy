@@ -1,729 +1,321 @@
-const MODEL_MAP = {
-  "deepseek-flash":
-    "deepseek-ai/deepseek-v4-flash-0731",
+const NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions";
 
-  "kimi":
-    "moonshotai/kimi-k3",
+// Model order:
+// 1. Kimi K3 — your current working model
+// 2. GLM-5.3 Flash — newer fallback
+// 3. GLM-5.3 — larger fallback
+// 4. Nemotron 3 Super — long-context fallback
+// 5. Gemma 4 31B — additional fallback
+const MODELS = [
+  "moonshotai/kimi-k3",
+  "z-ai/glm-5-3-flash",
+  "z-ai/glm-5-3",
+  "nvidia/nemotron-3-super-120b-a12b",
+  "google/gemma-4-31b-it"
+];
 
-  "nemotron":
-    "nvidia/nemotron-3.5-lightning-30b-a3b",
-
-  "gemma":
-    "google/gemma-4-31b-it"
-};
-
-const FALLBACKS = {
-  "deepseek-ai/deepseek-v4-flash-0731": [
-    "moonshotai/kimi-k3",
-    "nvidia/nemotron-3.5-lightning-30b-a3b",
-    "google/gemma-4-31b-it"
-  ],
-
-  "moonshotai/kimi-k3": [
-    "nvidia/nemotron-3.5-lightning-30b-a3b",
-    "google/gemma-4-31b-it"
-  ],
-
-  "nvidia/nemotron-3.5-lightning-30b-a3b": [
-    "google/gemma-4-31b-it"
-  ],
-
-  "google/gemma-4-31b-it": []
-};
-
-
-// --------------------------------------------------
-// NVIDIA REQUEST
-// --------------------------------------------------
-
-async function callNVIDIA(
-  model,
-  messages,
-  body,
-  env,
-  signal
-) {
-  return fetch(
-    "https://integrate.api.nvidia.com/v1/chat/completions",
-    {
-      method: "POST",
-      signal,
-
-      headers: {
-        Authorization:
-          `Bearer ${env.NIM_API_KEY}`,
-
-        "Content-Type":
-          "application/json"
-      },
-
-      body: JSON.stringify({
-        model,
-        messages,
-
-        temperature:
-          body.temperature ?? 0.85,
-
-        max_tokens:
-          Math.min(
-            body.max_tokens || 8024,
-            8024
-          ),
-
-        stream: true
-      })
-    }
-  );
-}
-
-
-// --------------------------------------------------
-// CORS
-// --------------------------------------------------
+const TIMEOUT_MS = 30000;
 
 function corsHeaders() {
   return {
     "Access-Control-Allow-Origin": "*",
-
-    "Access-Control-Allow-Methods":
-      "POST, GET, OPTIONS",
-
-    "Access-Control-Allow-Headers":
-      "Content-Type, Authorization"
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "*",
+    "Access-Control-Expose-Headers": "X-Model-Used",
   };
 }
 
+function jsonResponse(data, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      ...corsHeaders(),
+      ...extraHeaders,
+    },
+  });
+}
 
-// --------------------------------------------------
-// WORKER
-// --------------------------------------------------
+async function callNVIDIA(env, body, model) {
+  const controller = new AbortController();
 
-export default {
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, TIMEOUT_MS);
 
-  async fetch(request, env) {
+  try {
+    const requestBody = {
+      ...body,
+      model,
+      stream: true,
+    };
 
-    const url =
-      new URL(request.url);
-
-
-    // ------------------------------------------------
-    // OPTIONS / CORS
-    // ------------------------------------------------
-
-    if (
-      request.method === "OPTIONS"
-    ) {
-      return new Response(
-        null,
-        {
-          headers:
-            corsHeaders()
-        }
-      );
+    // GLM's NVIDIA endpoint supports reasoning separately from the
+    // visible answer. Clear thinking keeps reasoning out of the RP text.
+    if (model === "z-ai/glm-5-3" || model === "z-ai/glm-5-3-flash") {
+      requestBody.chat_template_kwargs = {
+        clear_thinking: true,
+      };
     }
 
+    const response = await fetch(NVIDIA_URL, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${env.NIM_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(requestBody),
+      signal: controller.signal,
+    });
 
-    // ------------------------------------------------
-    // HEALTH
-    // ------------------------------------------------
+    clearTimeout(timeout);
 
-    if (
-      url.pathname === "/health"
-    ) {
-      return new Response(
-        "OK",
-        {
-          headers:
-            corsHeaders()
-        }
-      );
+    if (!response.ok) {
+      const errorText = await response.text();
+
+      return {
+        ok: false,
+        status: response.status,
+        error: errorText.slice(0, 2000),
+      };
     }
 
-
-    // ------------------------------------------------
-    // TEST ENDPOINT
-    // ------------------------------------------------
-
-    if (
-      url.pathname === "/test"
-    ) {
-      return new Response(
-        JSON.stringify({
-          ok: true,
-          primary:
-            "deepseek-ai/deepseek-v4-flash-0731",
-
-          fallbacks: [
-            "moonshotai/kimi-k3",
-            "nvidia/nemotron-3.5-lightning-30b-a3b",
-            "google/gemma-4-31b-it"
-          ]
-        }),
-        {
-          headers: {
-            ...corsHeaders(),
-
-            "Content-Type":
-              "application/json"
-          }
-        }
-      );
+    if (!response.body) {
+      return {
+        ok: false,
+        status: 502,
+        error: "NVIDIA returned no response body",
+      };
     }
 
-
-    // ------------------------------------------------
-    // JANITORAI ENDPOINT
-    // ------------------------------------------------
-
-    if (
-      url.pathname !==
-      "/v1/chat/completions"
-    ) {
-      return new Response(
-        "Not Found",
-        {
-          status: 404,
-
-          headers:
-            corsHeaders()
-        }
-      );
-    }
-
-
-    // ------------------------------------------------
-    // PARSE REQUEST
-    // ------------------------------------------------
-
-    let body;
-
-    try {
-
-      body =
-        await request.json();
-
-    } catch {
-
-      return new Response(
-        JSON.stringify({
-          error:
-            "Invalid JSON"
-        }),
-        {
-          status: 400,
-
-          headers: {
-            ...corsHeaders(),
-
-            "Content-Type":
-              "application/json"
-          }
-        }
-      );
-    }
-
-
-    // ------------------------------------------------
-    // DEFAULT MODEL
-    //
-    // DeepSeek V4 Flash is primary.
-    // ------------------------------------------------
-
-    const inputModel =
-      body.model ||
-      "deepseek-flash";
-
-
-    const primaryModel =
-      MODEL_MAP[inputModel] ||
-      "deepseek-ai/deepseek-v4-flash-0731";
-
-
-    // ------------------------------------------------
-    // MESSAGES
-    // ------------------------------------------------
-
-    const messages =
-      Array.isArray(body.messages) &&
-      body.messages.length > 0
-
-        ? body.messages
-
-        : [
-            {
-              role: "user",
-              content: "Hello"
-            }
-          ];
-
-
-    // ------------------------------------------------
-    // MODEL CHAIN
-    // ------------------------------------------------
-
-    const chain = [
-      primaryModel,
-
-      ...(FALLBACKS[
-        primaryModel
-      ] || [])
-    ];
-
-
-    console.log(
-      "MODEL CHAIN:",
-      chain
-    );
-
-
-    let response = null;
-
-    let lastError = null;
-
-
-    // ------------------------------------------------
-    // TRY MODELS
-    // ------------------------------------------------
-
-    for (
-      let modelIndex = 0;
-      modelIndex < chain.length;
-      modelIndex++
-    ) {
-
-      const model =
-        chain[modelIndex];
-
-
-      console.log(
-        "TRYING MODEL:",
-        model
-      );
-
-
-      try {
-
-        const controller =
-          new AbortController();
-
-
-        /*
-         * Don't let one broken NVIDIA
-         * endpoint hang forever.
-         *
-         * 25 seconds is enough to catch
-         * an endpoint that isn't responding,
-         * while still giving the model
-         * some time to start streaming.
-         */
-
-        const timeout =
-          setTimeout(
-            () => {
-              console.log(
-                "MODEL TIMEOUT:",
-                model
-              );
-
-              controller.abort();
-            },
-            25000
-          );
-
-
-        let res;
-
-
-        try {
-
-          res =
-            await callNVIDIA(
-              model,
-              messages,
-              body,
-              env,
-              controller.signal
-            );
-
-        } finally {
-
-          clearTimeout(
-            timeout
-          );
-        }
-
-
-        // --------------------------------------------
-        // SUCCESS
-        // --------------------------------------------
-
-        if (
-          res.ok &&
-          res.body
-        ) {
-
-          console.log(
-            "MODEL USED:",
-            model
-          );
-
-          response =
-            res;
-
-          break;
-        }
-
-
-        // --------------------------------------------
-        // READ ERROR
-        // --------------------------------------------
-
-        const errorText =
-          await res.text();
-
-
-        lastError = {
-          model,
-          status:
-            res.status,
-          error:
-            errorText
-        };
-
-
-        console.log(
-          "MODEL FAILED:",
-          model,
-          res.status,
-          errorText
-        );
-
-
-        // --------------------------------------------
-        // RATE LIMIT
-        // --------------------------------------------
-
-        if (
-          res.status === 429
-        ) {
-
-          console.log(
-            "429 - MOVING TO FALLBACK:",
-            model
-          );
-
-          continue;
-        }
-
-
-        // --------------------------------------------
-        // GATEWAY / SERVER ERRORS
-        //
-        // 500
-        // 502
-        // 503
-        // 504
-        // 524
-        // etc.
-        // --------------------------------------------
-
-        if (
-          res.status >= 500
-        ) {
-
-          console.log(
-            "SERVER ERROR - MOVING TO FALLBACK:",
-            model,
-            res.status
-          );
-
-          continue;
-        }
-
-
-        // --------------------------------------------
-        // OTHER ERROR
-        // --------------------------------------------
-
-        console.log(
-          "NON-RETRYABLE MODEL ERROR:",
-          model,
-          res.status
-        );
-
-      } catch (error) {
-
-        const message =
-          error?.message ||
-          "Unknown error";
-
-
-        lastError = {
-          model,
-          error:
-            message
-        };
-
-
-        console.log(
-          "MODEL ERROR:",
-          model,
-          message
-        );
-
-
-        /*
-         * AbortError / timeout /
-         * connection failures should
-         * immediately move to fallback.
-         */
-
-        console.log(
-          "MOVING TO NEXT MODEL:",
-          model
-        );
-      }
-    }
-
-
-    // ------------------------------------------------
-    // EVERYTHING FAILED
-    // ------------------------------------------------
-
-    if (
-      !response ||
-      !response.body
-    ) {
-
-      return new Response(
-        JSON.stringify({
-          error:
-            "All NVIDIA models failed",
-
-          last_error:
-            lastError,
-
-          tried_models:
-            chain
-        }),
-
-        {
-          status: 502,
-
-          headers: {
-            ...corsHeaders(),
-
-            "Content-Type":
-              "application/json"
-          }
-        }
-      );
-    }
-
-
-    // ------------------------------------------------
-    // STREAM RESPONSE
-    // ------------------------------------------------
-
-    const {
-      readable,
-      writable
-    } =
-      new TransformStream();
-
-
-    const writer =
-      writable.getWriter();
-
-
-    const reader =
-      response.body.getReader();
-
-
-    const decoder =
-      new TextDecoder();
-
-
-    const encoder =
-      new TextEncoder();
-
-
-    // ------------------------------------------------
-    // STREAM PROCESSOR
-    // ------------------------------------------------
-
-    (async () => {
-
-      try {
-
-        let buffer = "";
-
-
-        while (true) {
-
-          const {
-            done,
-            value
-          } =
-            await reader.read();
-
-
-          if (done) {
-            break;
+    return {
+      ok: true,
+      response,
+    };
+  } catch (error) {
+    clearTimeout(timeout);
+
+    return {
+      ok: false,
+      status: error?.name === "AbortError" ? 504 : 502,
+      error: error?.message || String(error),
+    };
+  }
+}
+
+function cleanSSEStream(readable) {
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+
+  let buffer = "";
+
+  return readable.pipeThrough(
+    new TransformStream({
+      transform(chunk, controller) {
+        buffer += decoder.decode(chunk, { stream: true });
+
+        const parts = buffer.split("\n");
+        buffer = parts.pop() || "";
+
+        for (const line of parts) {
+          if (!line.startsWith("data: ")) {
+            controller.enqueue(encoder.encode(line + "\n"));
+            continue;
           }
 
+          const payload = line.slice(6);
 
-          buffer +=
-            decoder.decode(
-              value,
-              {
-                stream: true
+          if (payload === "[DONE]") {
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            continue;
+          }
+
+          try {
+            const json = JSON.parse(payload);
+
+            if (json.choices) {
+              for (const choice of json.choices) {
+                if (choice.delta) {
+                  // Prevent hidden reasoning from leaking into JanitorAI.
+                  delete choice.delta.reasoning_content;
+                  delete choice.delta.reasoning;
+                }
               }
+            }
+
+            controller.enqueue(
+              encoder.encode(`data: ${JSON.stringify(json)}\n\n`)
             );
-
-
-          const lines =
-            buffer.split("\n");
-
-
-          buffer =
-            lines.pop() || "";
-
-
-          for (
-            const line of lines
-          ) {
-
-            if (
-              !line.startsWith(
-                "data: "
-              )
-            ) {
-              continue;
-            }
-
-
-            // --------------------------------------
-            // DONE
-            // --------------------------------------
-
-            if (
-              line.includes(
-                "[DONE]"
-              )
-            ) {
-
-              await writer.write(
-                encoder.encode(
-                  "data: [DONE]\n\n"
-                )
-              );
-
-              continue;
-            }
-
-
-            // --------------------------------------
-            // JSON
-            // --------------------------------------
-
-            try {
-
-              const json =
-                JSON.parse(
-                  line.slice(6)
-                );
-
-
-              // Remove reasoning
-              // fields from the stream.
-
-              if (
-                json
-                  .choices?.[0]
-                  ?.delta
-              ) {
-
-                delete json
-                  .choices[0]
-                  .delta
-                  .reasoning_content;
-
-
-                delete json
-                  .choices[0]
-                  .delta
-                  .reasoning;
-              }
-
-
-              await writer.write(
-                encoder.encode(
-                  `data: ${JSON.stringify(
-                    json
-                  )}\n\n`
-                )
-              );
-
-
-            } catch {
-
-              await writer.write(
-                encoder.encode(
-                  line + "\n\n"
-                )
-              );
-            }
+          } catch {
+            // Preserve malformed/unexpected SSE lines rather than crashing.
+            controller.enqueue(encoder.encode(line + "\n"));
           }
         }
+      },
 
+      flush(controller) {
+        if (buffer) {
+          controller.enqueue(encoder.encode(buffer + "\n"));
+        }
+      },
+    })
+  );
+}
 
-        await writer.close();
+async function handleChat(request, env) {
+  let body;
 
-
-      } catch (error) {
-
-        console.log(
-          "STREAM ERROR:",
-          error?.message
-        );
-
-
-        try {
-
-          await writer.abort(
-            error
-          );
-
-        } catch {}
-      }
-
-    })();
-
-
-    // ------------------------------------------------
-    // RETURN STREAM
-    // ------------------------------------------------
-
-    return new Response(
-      readable,
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse(
       {
-        headers: {
-          ...corsHeaders(),
-
-          "Content-Type":
-            "text/event-stream",
-
-          "Cache-Control":
-            "no-cache, no-transform",
-
-          "X-Accel-Buffering":
-            "no",
-
-          "Connection":
-            "keep-alive"
-        }
-      }
+        error: {
+          message: "Invalid JSON request body",
+          type: "invalid_request_error",
+        },
+      },
+      400
     );
   }
+
+  if (!body.messages || !Array.isArray(body.messages)) {
+    return jsonResponse(
+      {
+        error: {
+          message: "Missing messages array",
+          type: "invalid_request_error",
+        },
+      },
+      400
+    );
+  }
+
+  // Don't let JanitorAI's model name force an unavailable/deprecated model.
+  // The Worker controls the actual NVIDIA model used.
+  const originalModel = body.model;
+
+  // Reasonable defaults for RP.
+  const upstreamBody = {
+    messages: body.messages,
+    temperature:
+      typeof body.temperature === "number"
+        ? body.temperature
+        : 0.85,
+    top_p:
+      typeof body.top_p === "number"
+        ? body.top_p
+        : 0.95,
+    max_tokens:
+      typeof body.max_tokens === "number"
+        ? body.max_tokens
+        : 2048,
+    stream: true,
+  };
+
+  // Preserve other OpenAI-compatible parameters JanitorAI may send.
+  const optionalFields = [
+    "frequency_penalty",
+    "presence_penalty",
+    "stop",
+    "seed",
+    "response_format",
+  ];
+
+  for (const field of optionalFields) {
+    if (body[field] !== undefined) {
+      upstreamBody[field] = body[field];
+    }
+  }
+
+  const failures = [];
+
+  for (const model of MODELS) {
+    const result = await callNVIDIA(env, upstreamBody, model);
+
+    if (result.ok) {
+      const headers = {
+        ...corsHeaders(),
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        "Connection": "keep-alive",
+        "X-Model-Used": model,
+      };
+
+      return new Response(
+        cleanSSEStream(result.response.body),
+        {
+          status: 200,
+          headers,
+        }
+      );
+    }
+
+    failures.push({
+      model,
+      status: result.status,
+      error: result.error,
+    });
+  }
+
+  return jsonResponse(
+    {
+      error: {
+        message: "All NVIDIA models failed",
+        type: "upstream_error",
+        requested_model: originalModel || null,
+        attempts: failures,
+      },
+    },
+    502
+  );
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    // CORS preflight
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders(),
+      });
+    }
+
+    // Health check
+    if (url.pathname === "/health") {
+      return jsonResponse({
+        ok: true,
+        worker: "nim-proxy",
+        models: MODELS,
+      });
+    }
+
+    // Show currently configured models
+    if (url.pathname === "/models") {
+      return jsonResponse({
+        models: MODELS,
+        timeout_ms: TIMEOUT_MS,
+      });
+    }
+
+    // NVIDIA/OpenAI-compatible endpoint
+    if (
+      url.pathname === "/v1/chat/completions" &&
+      request.method === "POST"
+    ) {
+      return handleChat(request, env);
+    }
+
+    return jsonResponse({
+      ok: true,
+      message: "NVIDIA NIM proxy is running",
+      endpoints: [
+        "/health",
+        "/models",
+        "/v1/chat/completions",
+      ],
+    });
+  },
 };
