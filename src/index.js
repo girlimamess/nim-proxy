@@ -1,73 +1,59 @@
-const NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions";
+const NVIDIA_URL =
+  "https://integrate.api.nvidia.com/v1/chat/completions";
 
-// Model order:
-// 1. Kimi K3 — your current working model
-// 2. GLM-5.3 Flash — newer fallback
-// 3. GLM-5.3 — larger fallback
-// 4. Nemotron 3 Super — long-context fallback
-// 5. Gemma 4 31B — additional fallback
 const MODELS = [
-  "moonshotai/kimi-k3",
-  "z-ai/glm-5-3-flash",
-  "z-ai/glm-5-3",
+  "deepseek-ai/deepseek-v4.1-flash",
   "nvidia/nemotron-3-super-120b-a12b",
-  "google/gemma-4-31b-it"
+  "google/gemma-4-31b-it",
+  "nvidia/nemotron-3.5-lightning-30b-a3b",
+  "openai/gpt-oss-20b"
 ];
 
-const TIMEOUT_MS = 30000;
+const TIMEOUT_MS = 25000;
 
 function corsHeaders() {
   return {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "*",
-    "Access-Control-Expose-Headers": "X-Model-Used",
+    "Access-Control-Expose-Headers": "X-Model-Used"
   };
 }
 
-function jsonResponse(data, status = 200, extraHeaders = {}) {
+function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
       "Content-Type": "application/json",
-      ...corsHeaders(),
-      ...extraHeaders,
-    },
+      ...corsHeaders()
+    }
   });
 }
 
 async function callNVIDIA(env, body, model) {
   const controller = new AbortController();
-
-  const timeout = setTimeout(() => {
-    controller.abort();
-  }, TIMEOUT_MS);
+  const timeout = setTimeout(
+    () => controller.abort(),
+    TIMEOUT_MS
+  );
 
   try {
-    const requestBody = {
-      ...body,
-      model,
-      stream: true,
-    };
-
-    // GLM's NVIDIA endpoint supports reasoning separately from the
-    // visible answer. Clear thinking keeps reasoning out of the RP text.
-    if (model === "z-ai/glm-5-3" || model === "z-ai/glm-5-3-flash") {
-      requestBody.chat_template_kwargs = {
-        clear_thinking: true,
-      };
-    }
-
     const response = await fetch(NVIDIA_URL, {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${env.NIM_API_KEY}`,
-        "Content-Type": "application/json",
+        "Content-Type": "application/json"
       },
-      body: JSON.stringify(requestBody),
-      signal: controller.signal,
+      body: JSON.stringify({
+        ...body,
+        model,
+        stream: true
+      }),
+      signal: controller.signal
     });
 
+    // Only time out while waiting for the initial response.
+    // Don't abort a healthy generation just because it takes time.
     clearTimeout(timeout);
 
     if (!response.ok) {
@@ -76,7 +62,7 @@ async function callNVIDIA(env, body, model) {
       return {
         ok: false,
         status: response.status,
-        error: errorText.slice(0, 2000),
+        error: errorText.slice(0, 1500)
       };
     }
 
@@ -84,13 +70,13 @@ async function callNVIDIA(env, body, model) {
       return {
         ok: false,
         status: 502,
-        error: "NVIDIA returned no response body",
+        error: "NVIDIA returned no response body"
       };
     }
 
     return {
       ok: true,
-      response,
+      response
     };
   } catch (error) {
     clearTimeout(timeout);
@@ -98,7 +84,7 @@ async function callNVIDIA(env, body, model) {
     return {
       ok: false,
       status: error?.name === "AbortError" ? 504 : 502,
-      error: error?.message || String(error),
+      error: error?.message || String(error)
     };
   }
 }
@@ -106,7 +92,6 @@ async function callNVIDIA(env, body, model) {
 function cleanSSEStream(readable) {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
-
   let buffer = "";
 
   return readable.pipeThrough(
@@ -114,10 +99,12 @@ function cleanSSEStream(readable) {
       transform(chunk, controller) {
         buffer += decoder.decode(chunk, { stream: true });
 
-        const parts = buffer.split("\n");
-        buffer = parts.pop() || "";
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
 
-        for (const line of parts) {
+        for (let line of lines) {
+          line = line.replace(/\r$/, "");
+
           if (!line.startsWith("data: ")) {
             controller.enqueue(encoder.encode(line + "\n"));
             continue;
@@ -126,82 +113,91 @@ function cleanSSEStream(readable) {
           const payload = line.slice(6);
 
           if (payload === "[DONE]") {
-            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            controller.enqueue(
+              encoder.encode("data: [DONE]\n\n")
+            );
             continue;
           }
 
           try {
-            const json = JSON.parse(payload);
+            const data = JSON.parse(payload);
 
-            if (json.choices) {
-              for (const choice of json.choices) {
+            if (Array.isArray(data.choices)) {
+              for (const choice of data.choices) {
                 if (choice.delta) {
-                  // Prevent hidden reasoning from leaking into JanitorAI.
                   delete choice.delta.reasoning_content;
                   delete choice.delta.reasoning;
+                }
+
+                if (choice.message) {
+                  delete choice.message.reasoning_content;
+                  delete choice.message.reasoning;
                 }
               }
             }
 
             controller.enqueue(
-              encoder.encode(`data: ${JSON.stringify(json)}\n\n`)
+              encoder.encode(
+                `data: ${JSON.stringify(data)}\n\n`
+              )
             );
           } catch {
-            // Preserve malformed/unexpected SSE lines rather than crashing.
-            controller.enqueue(encoder.encode(line + "\n"));
+            controller.enqueue(
+              encoder.encode(line + "\n")
+            );
           }
         }
       },
 
       flush(controller) {
         if (buffer) {
-          controller.enqueue(encoder.encode(buffer + "\n"));
+          controller.enqueue(
+            encoder.encode(buffer + "\n")
+          );
         }
-      },
+      }
     })
   );
 }
 
 async function handleChat(request, env) {
+  if (!env.NIM_API_KEY) {
+    return jsonResponse({
+      error: {
+        message: "NIM_API_KEY Worker secret is missing",
+        type: "configuration_error"
+      }
+    }, 500);
+  }
+
   let body;
 
   try {
     body = await request.json();
   } catch {
-    return jsonResponse(
-      {
-        error: {
-          message: "Invalid JSON request body",
-          type: "invalid_request_error",
-        },
-      },
-      400
-    );
+    return jsonResponse({
+      error: {
+        message: "Invalid JSON request body",
+        type: "invalid_request_error"
+      }
+    }, 400);
   }
 
-  if (!body.messages || !Array.isArray(body.messages)) {
-    return jsonResponse(
-      {
-        error: {
-          message: "Missing messages array",
-          type: "invalid_request_error",
-        },
-      },
-      400
-    );
+  if (!Array.isArray(body.messages)) {
+    return jsonResponse({
+      error: {
+        message: "Missing messages array",
+        type: "invalid_request_error"
+      }
+    }, 400);
   }
 
-  // Don't let JanitorAI's model name force an unavailable/deprecated model.
-  // The Worker controls the actual NVIDIA model used.
-  const originalModel = body.model;
-
-  // Reasonable defaults for RP.
   const upstreamBody = {
     messages: body.messages,
     temperature:
       typeof body.temperature === "number"
         ? body.temperature
-        : 0.85,
+        : 0.9,
     top_p:
       typeof body.top_p === "number"
         ? body.top_p
@@ -210,16 +206,15 @@ async function handleChat(request, env) {
       typeof body.max_tokens === "number"
         ? body.max_tokens
         : 2048,
-    stream: true,
+    stream: true
   };
 
-  // Preserve other OpenAI-compatible parameters JanitorAI may send.
   const optionalFields = [
     "frequency_penalty",
     "presence_penalty",
     "stop",
     "seed",
-    "response_format",
+    "response_format"
   ];
 
   for (const field of optionalFields) {
@@ -231,22 +226,25 @@ async function handleChat(request, env) {
   const failures = [];
 
   for (const model of MODELS) {
-    const result = await callNVIDIA(env, upstreamBody, model);
+    const result = await callNVIDIA(
+      env,
+      upstreamBody,
+      model
+    );
 
     if (result.ok) {
-      const headers = {
-        ...corsHeaders(),
-        "Content-Type": "text/event-stream; charset=utf-8",
-        "Cache-Control": "no-cache, no-transform",
-        "Connection": "keep-alive",
-        "X-Model-Used": model,
-      };
-
       return new Response(
         cleanSSEStream(result.response.body),
         {
           status: 200,
-          headers,
+          headers: {
+            ...corsHeaders(),
+            "Content-Type":
+              "text/event-stream; charset=utf-8",
+            "Cache-Control":
+              "no-cache, no-transform",
+            "X-Model-Used": model
+          }
         }
       );
     }
@@ -254,53 +252,46 @@ async function handleChat(request, env) {
     failures.push({
       model,
       status: result.status,
-      error: result.error,
+      error: result.error
     });
   }
 
-  return jsonResponse(
-    {
-      error: {
-        message: "All NVIDIA models failed",
-        type: "upstream_error",
-        requested_model: originalModel || null,
-        attempts: failures,
-      },
-    },
-    502
-  );
+  return jsonResponse({
+    error: {
+      message: "All configured NVIDIA models failed",
+      type: "upstream_error",
+      attempts: failures
+    }
+  }, 502);
 }
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // CORS preflight
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
-        headers: corsHeaders(),
+        headers: corsHeaders()
       });
     }
 
-    // Health check
     if (url.pathname === "/health") {
       return jsonResponse({
         ok: true,
         worker: "nim-proxy",
-        models: MODELS,
+        primary: MODELS[0],
+        models: MODELS
       });
     }
 
-    // Show currently configured models
     if (url.pathname === "/models") {
       return jsonResponse({
         models: MODELS,
-        timeout_ms: TIMEOUT_MS,
+        timeout_ms: TIMEOUT_MS
       });
     }
 
-    // NVIDIA/OpenAI-compatible endpoint
     if (
       url.pathname === "/v1/chat/completions" &&
       request.method === "POST"
@@ -314,8 +305,8 @@ export default {
       endpoints: [
         "/health",
         "/models",
-        "/v1/chat/completions",
-      ],
+        "/v1/chat/completions"
+      ]
     });
-  },
+  }
 };
