@@ -1,17 +1,18 @@
-var __defProp = Object.defineProperty;
-var __name = (target, value) => __defProp(target, "name", { value, configurable: true });
 
-// src/index.js
-var NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions";
-var MODELS = [
+const NVIDIA_URL =
+  "https://integrate.api.nvidia.com/v1/chat/completions";
+
+const MODELS = [
   "deepseek-ai/deepseek-v4.1-flash",
-  "stepfun-ai/step-5-preview",
   "nvidia/nemotron-3-super-120b-a12b",
   "google/gemma-4-31b-it",
   "nvidia/nemotron-3.5-lightning-30b-a3b",
-  "openai/gpt-oss-20b"
+  "openai/gpt-oss-20b",
+  "stepfun-ai/step-5-preview"
 ];
-var TIMEOUT_MS = 25e3;
+
+const TIMEOUT_MS = 25000;
+
 function corsHeaders() {
   return {
     "Access-Control-Allow-Origin": "*",
@@ -20,29 +21,31 @@ function corsHeaders() {
     "Access-Control-Expose-Headers": "X-Model-Used"
   };
 }
-__name(corsHeaders, "corsHeaders");
+
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
-      "Content-Type": "application/json",
+      "Content-Type": "application/json; charset=utf-8",
       ...corsHeaders()
     }
   });
 }
-__name(jsonResponse, "jsonResponse");
+
 async function callNVIDIA(env, body, model) {
   const controller = new AbortController();
   const timeout = setTimeout(
     () => controller.abort(),
     TIMEOUT_MS
   );
+
   try {
     const response = await fetch(NVIDIA_URL, {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${env.NIM_API_KEY}`,
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream"
       },
       body: JSON.stringify({
         ...body,
@@ -51,28 +54,46 @@ async function callNVIDIA(env, body, model) {
       }),
       signal: controller.signal
     });
-    clearTimeout(timeout);
+
     if (!response.ok) {
-      const errorText = await response.text();
+      let errorText = "";
+
+      try {
+        errorText = await response.text();
+      } catch {
+        errorText = "Could not read NVIDIA error response";
+      }
+
+      clearTimeout(timeout);
+
       return {
         ok: false,
         status: response.status,
         error: errorText.slice(0, 1500)
       };
     }
+
     if (!response.body) {
+      clearTimeout(timeout);
+
       return {
         ok: false,
         status: 502,
         error: "NVIDIA returned no response body"
       };
     }
+
+    // Keep the abort signal active while the response stream is consumed.
+    // The caller clears it when the stream finishes or is cancelled.
     return {
       ok: true,
-      response
+      response,
+      controller,
+      timeout
     };
   } catch (error) {
     clearTimeout(timeout);
+
     return {
       ok: false,
       status: error?.name === "AbortError" ? 504 : 502,
@@ -80,69 +101,91 @@ async function callNVIDIA(env, body, model) {
     };
   }
 }
-__name(callNVIDIA, "callNVIDIA");
-function cleanSSEStream(readable) {
+
+function cleanSSEStream(readable, controller, timeout) {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   let buffer = "";
+
+  const cleanup = () => clearTimeout(timeout);
+
   return readable.pipeThrough(
     new TransformStream({
-      transform(chunk, controller) {
+      transform(chunk, streamController) {
         buffer += decoder.decode(chunk, { stream: true });
+
         const lines = buffer.split("\n");
         buffer = lines.pop() || "";
+
         for (let line of lines) {
           line = line.replace(/\r$/, "");
+
           if (!line.startsWith("data: ")) {
-            controller.enqueue(encoder.encode(line + "\n"));
+            streamController.enqueue(encoder.encode(line + "\n"));
             continue;
           }
+
           const payload = line.slice(6);
+
           if (payload === "[DONE]") {
-            controller.enqueue(
+            streamController.enqueue(
               encoder.encode("data: [DONE]\n\n")
             );
             continue;
           }
+
           try {
             const data = JSON.parse(payload);
+
             if (Array.isArray(data.choices)) {
               for (const choice of data.choices) {
                 if (choice.delta) {
                   delete choice.delta.reasoning_content;
                   delete choice.delta.reasoning;
                 }
+
                 if (choice.message) {
                   delete choice.message.reasoning_content;
                   delete choice.message.reasoning;
                 }
               }
             }
-            controller.enqueue(
-              encoder.encode(
-                `data: ${JSON.stringify(data)}
 
-`
-              )
+            streamController.enqueue(
+              encoder.encode(`data: ${JSON.stringify(data)}\n\n`)
             );
           } catch {
-            controller.enqueue(
+            streamController.enqueue(
               encoder.encode(line + "\n")
             );
           }
         }
       },
-      flush(controller) {
+
+      flush(streamController) {
+        buffer += decoder.decode();
+
         if (buffer) {
-          controller.enqueue(
+          streamController.enqueue(
             encoder.encode(buffer + "\n")
           );
         }
+
+        cleanup();
+      }
+    })
+  ).pipeThrough(
+    new TransformStream({
+      transform(chunk, streamController) {
+        streamController.enqueue(chunk);
+      },
+      flush() {
+        cleanup();
       }
     })
   );
 }
-__name(cleanSSEStream, "cleanSSEStream");
+
 async function handleChat(request, env) {
   if (!env.NIM_API_KEY) {
     return jsonResponse({
@@ -152,7 +195,9 @@ async function handleChat(request, env) {
       }
     }, 500);
   }
+
   let body;
+
   try {
     body = await request.json();
   } catch {
@@ -163,21 +208,27 @@ async function handleChat(request, env) {
       }
     }, 400);
   }
-  if (!Array.isArray(body.messages)) {
+
+  if (!Array.isArray(body.messages) || body.messages.length === 0) {
     return jsonResponse({
       error: {
-        message: "Missing messages array",
+        message: "Missing or empty messages array",
         type: "invalid_request_error"
       }
     }, 400);
   }
+
   const upstreamBody = {
     messages: body.messages,
-    temperature: typeof body.temperature === "number" ? body.temperature : 0.9,
-    top_p: typeof body.top_p === "number" ? body.top_p : 0.95,
-    max_tokens: typeof body.max_tokens === "number" ? body.max_tokens : 2048,
+    temperature:
+      typeof body.temperature === "number" ? body.temperature : 0.9,
+    top_p:
+      typeof body.top_p === "number" ? body.top_p : 0.95,
+    max_tokens:
+      typeof body.max_tokens === "number" ? body.max_tokens : 2048,
     stream: true
   };
+
   const optionalFields = [
     "frequency_penalty",
     "presence_penalty",
@@ -185,38 +236,43 @@ async function handleChat(request, env) {
     "seed",
     "response_format"
   ];
+
   for (const field of optionalFields) {
-    if (body[field] !== void 0) {
+    if (body[field] !== undefined) {
       upstreamBody[field] = body[field];
     }
   }
+
   const failures = [];
+
   for (const model of MODELS) {
-    const result = await callNVIDIA(
-      env,
-      upstreamBody,
-      model
-    );
+    const result = await callNVIDIA(env, upstreamBody, model);
+
     if (result.ok) {
-      return new Response(
-        cleanSSEStream(result.response.body),
-        {
-          status: 200,
-          headers: {
-            ...corsHeaders(),
-            "Content-Type": "text/event-stream; charset=utf-8",
-            "Cache-Control": "no-cache, no-transform",
-            "X-Model-Used": model
-          }
-        }
+      const stream = cleanSSEStream(
+        result.response.body,
+        result.controller,
+        result.timeout
       );
+
+      return new Response(stream, {
+        status: 200,
+        headers: {
+          ...corsHeaders(),
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache, no-transform",
+          "X-Model-Used": model
+        }
+      });
     }
+
     failures.push({
       model,
       status: result.status,
       error: result.error
     });
   }
+
   return jsonResponse({
     error: {
       message: "All configured NVIDIA models failed",
@@ -225,16 +281,18 @@ async function handleChat(request, env) {
     }
   }, 502);
 }
-__name(handleChat, "handleChat");
-var index_default = {
+
+export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
         headers: corsHeaders()
       });
     }
+
     if (url.pathname === "/health") {
       return jsonResponse({
         ok: true,
@@ -243,15 +301,21 @@ var index_default = {
         models: MODELS
       });
     }
+
     if (url.pathname === "/models") {
       return jsonResponse({
         models: MODELS,
         timeout_ms: TIMEOUT_MS
       });
     }
-    if (url.pathname === "/v1/chat/completions" && request.method === "POST") {
+
+    if (
+      url.pathname === "/v1/chat/completions" &&
+      request.method === "POST"
+    ) {
       return handleChat(request, env);
     }
+
     return jsonResponse({
       ok: true,
       message: "NVIDIA NIM proxy is running",
@@ -263,7 +327,3 @@ var index_default = {
     });
   }
 };
-export {
-  index_default as default
-};
-//# sourceMappingURL=index.js.map
