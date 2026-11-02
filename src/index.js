@@ -1,13 +1,13 @@
-
 const NVIDIA_URL =
   "https://integrate.api.nvidia.com/v1/chat/completions";
 
 const MODELS = [
   "deepseek-ai/deepseek-v4.1-flash",
-  "nvidia/nemotron-3-super-120b-a12b",
+  "minimaxai/minimax-m3.1-flash",
   "google/gemma-4-31b-it",
+  "z-ai/glm-5-3-flash",
   "nvidia/nemotron-3.5-lightning-30b-a3b",
-  "openai/gpt-oss-20b",
+  "nvidia/nemotron-3.5-super-vl-120b-a12b",
   "stepfun-ai/step-5-preview"
 ];
 
@@ -34,13 +34,16 @@ function jsonResponse(data, status = 200) {
 
 async function callNVIDIA(env, body, model) {
   const controller = new AbortController();
+
   const timeout = setTimeout(
     () => controller.abort(),
     TIMEOUT_MS
   );
 
+  let response;
+
   try {
-    const response = await fetch(NVIDIA_URL, {
+    response = await fetch(NVIDIA_URL, {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${env.NIM_API_KEY}`,
@@ -54,43 +57,6 @@ async function callNVIDIA(env, body, model) {
       }),
       signal: controller.signal
     });
-
-    if (!response.ok) {
-      let errorText = "";
-
-      try {
-        errorText = await response.text();
-      } catch {
-        errorText = "Could not read NVIDIA error response";
-      }
-
-      clearTimeout(timeout);
-
-      return {
-        ok: false,
-        status: response.status,
-        error: errorText.slice(0, 1500)
-      };
-    }
-
-    if (!response.body) {
-      clearTimeout(timeout);
-
-      return {
-        ok: false,
-        status: 502,
-        error: "NVIDIA returned no response body"
-      };
-    }
-
-    // Keep the abort signal active while the response stream is consumed.
-    // The caller clears it when the stream finishes or is cancelled.
-    return {
-      ok: true,
-      response,
-      controller,
-      timeout
-    };
   } catch (error) {
     clearTimeout(timeout);
 
@@ -100,90 +66,41 @@ async function callNVIDIA(env, body, model) {
       error: error?.message || String(error)
     };
   }
-}
 
-function cleanSSEStream(readable, controller, timeout) {
-  const decoder = new TextDecoder();
-  const encoder = new TextEncoder();
-  let buffer = "";
+  if (!response.ok) {
+    let errorText = "";
 
-  const cleanup = () => clearTimeout(timeout);
+    try {
+      errorText = await response.text();
+    } catch (error) {
+      errorText = error?.message || "Could not read NVIDIA error";
+    }
 
-  return readable.pipeThrough(
-    new TransformStream({
-      transform(chunk, streamController) {
-        buffer += decoder.decode(chunk, { stream: true });
+    clearTimeout(timeout);
 
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
+    return {
+      ok: false,
+      status: response.status,
+      error: errorText.slice(0, 1500)
+    };
+  }
 
-        for (let line of lines) {
-          line = line.replace(/\r$/, "");
+  if (!response.body) {
+    clearTimeout(timeout);
 
-          if (!line.startsWith("data: ")) {
-            streamController.enqueue(encoder.encode(line + "\n"));
-            continue;
-          }
+    return {
+      ok: false,
+      status: 502,
+      error: "NVIDIA returned no response body"
+    };
+  }
 
-          const payload = line.slice(6);
+  clearTimeout(timeout);
 
-          if (payload === "[DONE]") {
-            streamController.enqueue(
-              encoder.encode("data: [DONE]\n\n")
-            );
-            continue;
-          }
-
-          try {
-            const data = JSON.parse(payload);
-
-            if (Array.isArray(data.choices)) {
-              for (const choice of data.choices) {
-                if (choice.delta) {
-                  delete choice.delta.reasoning_content;
-                  delete choice.delta.reasoning;
-                }
-
-                if (choice.message) {
-                  delete choice.message.reasoning_content;
-                  delete choice.message.reasoning;
-                }
-              }
-            }
-
-            streamController.enqueue(
-              encoder.encode(`data: ${JSON.stringify(data)}\n\n`)
-            );
-          } catch {
-            streamController.enqueue(
-              encoder.encode(line + "\n")
-            );
-          }
-        }
-      },
-
-      flush(streamController) {
-        buffer += decoder.decode();
-
-        if (buffer) {
-          streamController.enqueue(
-            encoder.encode(buffer + "\n")
-          );
-        }
-
-        cleanup();
-      }
-    })
-  ).pipeThrough(
-    new TransformStream({
-      transform(chunk, streamController) {
-        streamController.enqueue(chunk);
-      },
-      flush() {
-        cleanup();
-      }
-    })
-  );
+  return {
+    ok: true,
+    response
+  };
 }
 
 async function handleChat(request, env) {
@@ -221,11 +138,17 @@ async function handleChat(request, env) {
   const upstreamBody = {
     messages: body.messages,
     temperature:
-      typeof body.temperature === "number" ? body.temperature : 0.9,
+      typeof body.temperature === "number"
+        ? body.temperature
+        : 0.9,
     top_p:
-      typeof body.top_p === "number" ? body.top_p : 0.95,
+      typeof body.top_p === "number"
+        ? body.top_p
+        : 0.95,
     max_tokens:
-      typeof body.max_tokens === "number" ? body.max_tokens : 2048,
+      typeof body.max_tokens === "number"
+        ? body.max_tokens
+        : 2048,
     stream: true
   };
 
@@ -246,20 +169,20 @@ async function handleChat(request, env) {
   const failures = [];
 
   for (const model of MODELS) {
-    const result = await callNVIDIA(env, upstreamBody, model);
+    const result = await callNVIDIA(
+      env,
+      upstreamBody,
+      model
+    );
 
     if (result.ok) {
-      const stream = cleanSSEStream(
-        result.response.body,
-        result.controller,
-        result.timeout
-      );
-
-      return new Response(stream, {
-        status: 200,
+      return new Response(result.response.body, {
+        status: result.response.status,
         headers: {
           ...corsHeaders(),
-          "Content-Type": "text/event-stream; charset=utf-8",
+          "Content-Type":
+            result.response.headers.get("Content-Type") ||
+            "text/event-stream; charset=utf-8",
           "Cache-Control": "no-cache, no-transform",
           "X-Model-Used": model
         }
